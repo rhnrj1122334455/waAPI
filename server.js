@@ -51,6 +51,8 @@ async function createSession(userId) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
+        browser: ["Chrome (Linux)", "", ""],
+        qrTimeout: 40000
     });
 
     client.sock = sock;
