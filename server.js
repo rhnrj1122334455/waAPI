@@ -13,7 +13,7 @@ const PORT = 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-let sock; // Declare the socket globally
+let sock; // Global socket variable
 
 async function startBot() {
     try {
@@ -26,13 +26,13 @@ async function startBot() {
 
         sock.ev.on("creds.update", saveCreds);
 
-        sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+        sock.ev.on("connection.update", async ({ connection }) => {
             if (connection === "open") {
                 console.log("✅ Connected to WhatsApp!");
             } else if (connection === "close") {
                 console.log("❌ Disconnected. Reconnecting...");
-                await delay(5000); // Wait 5 seconds before reconnecting
-                startBot(); // Restart the bot
+                await delay(5000);
+                startBot();
             } else {
                 console.log(`⚠️ Connection status: ${connection}`);
             }
@@ -68,10 +68,10 @@ app.post("/send-message", async (req, res) => {
     try {
         console.log(`📩 Sending message to: ${formattedNumber}`);
 
-        await sock.sendMessage(formattedNumber, { text: message });
+        const sentMsg = await sock.sendMessage(formattedNumber, { text: message });
 
         console.log(`✅ Message successfully sent to ${formattedNumber}`);
-        res.json({ success: true, message: "Message sent successfully" });
+        res.json({ success: true, message: "Message sent successfully", id: sentMsg.key.id });
 
     } catch (error) {
         console.error(`❌ Failed to send message: ${error.message}`);
