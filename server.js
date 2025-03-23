@@ -3,13 +3,14 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto"); // ✅ Fix for "crypto is not defined"
 const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason
 } = require("@whiskeysockets/baileys");
 
-// Delete old authentication folder if exists
+// Delete old authentication folder
 const authFolder = path.join(__dirname, "auth_info_baileys");
 if (fs.existsSync(authFolder)) {
     fs.rmSync(authFolder, { recursive: true, force: true });
@@ -18,14 +19,13 @@ if (fs.existsSync(authFolder)) {
 
 // Initialize Express
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(bodyParser.json());
 
 async function startBot() {
     try {
-        // Initialize authentication state
         const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
 
         const sock = makeWASocket({
@@ -41,7 +41,7 @@ async function startBot() {
             } else if (connection === "close") {
                 const reason = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.message;
                 console.log(`❌ Disconnected. Reason: ${reason}`);
-                
+
                 if (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
                     console.log("🔄 Reconnecting...");
                     startBot(); // Restart bot
@@ -51,7 +51,6 @@ async function startBot() {
             }
         });
 
-        // API Endpoint to send messages
         app.post("/send-message", async (req, res) => {
             const { number, message } = req.body;
 
