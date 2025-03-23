@@ -11,11 +11,15 @@ const PORT = 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// 🔹 Delete auth folder if it exists (Prevents corrupted sessions)
+// 🔹 Delete auth folder if it exists (Prevent corrupted sessions)
 const authFolder = "auth_info_baileys";
 if (fs.existsSync(authFolder)) {
-    fs.rmSync(authFolder, { recursive: true, force: true });
-    console.log("🗑️ Deleted old auth_info_baileys folder.");
+    try {
+        fs.rmSync(authFolder, { recursive: true, force: true });
+        console.log("🗑️ Deleted old auth_info_baileys folder.");
+    } catch (err) {
+        console.error("❌ Failed to delete auth_info_baileys:", err);
+    }
 }
 
 async function startBot() {
@@ -28,7 +32,7 @@ async function startBot() {
 
         sock.ev.on("creds.update", saveCreds);
 
-        // 🔹 Handle connection updates
+        // 🔹 Handle Connection Updates
         sock.ev.on("connection.update", (update) => {
             const { connection, lastDisconnect } = update;
             console.log("🔹 Connection Update:", update);
@@ -36,19 +40,19 @@ async function startBot() {
             if (connection === "open") {
                 console.log("✅ Connected to WhatsApp!");
             } else if (connection === "close") {
-                const reason = lastDisconnect?.error?.output?.statusCode;
-                console.log("❌ Disconnected. Reason:", reason);
+                const reason = lastDisconnect?.error?.output?.statusCode || "Unknown";
+                console.log(`❌ Disconnected. Reason: ${reason}`);
 
                 if (reason !== DisconnectReason.loggedOut) {
-                    console.log("🔄 Reconnecting...");
-                    startBot();
+                    console.log("🔄 Reconnecting in 5 seconds...");
+                    setTimeout(startBot, 5000);
                 } else {
                     console.log("⚠️ Logged out. Scan QR again.");
                 }
             }
         });
 
-        // 🔹 API Endpoint to send messages
+        // 🔹 API Endpoint to Send Messages
         app.post("/send-message", async (req, res) => {
             const { number, message } = req.body;
 
@@ -59,23 +63,23 @@ async function startBot() {
             const formattedNumber = number.includes("@s.whatsapp.net") ? number : number + "@s.whatsapp.net";
 
             try {
-                await sock.sendMessage(formattedNumber, { text: message });
+                const sentMessage = await sock.sendMessage(formattedNumber, { text: message });
                 console.log(`✅ Message sent to ${formattedNumber}: ${message}`);
-                res.json({ success: true, message: "Message sent successfully" });
+                res.json({ success: true, messageId: sentMessage?.key?.id || "unknown" });
             } catch (error) {
                 console.error(`❌ Failed to send message:`, error);
                 res.status(500).json({ success: false, error: "Failed to send message" });
             }
         });
 
-        // 🔹 Start Express server
+        // 🔹 Start Express Server
         app.listen(PORT, () => {
             console.log(`🚀 API Server running on http://localhost:${PORT}`);
         });
 
     } catch (error) {
         console.error("🔥 Fatal Error:", error);
-        console.log("🔄 Restarting bot...");
+        console.log("🔄 Restarting bot in 5 seconds...");
         setTimeout(startBot, 5000);
     }
 }
