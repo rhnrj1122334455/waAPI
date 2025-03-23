@@ -27,7 +27,6 @@ if (!fs.existsSync(SESSIONS_DIR)) {
 
 // Create a new WhatsApp session for a user
 async function createSession(userId) {
-    // If session exists, delete it
     if (clients.has(userId)) {
         const existingClient = clients.get(userId);
         existingClient.sock.end();
@@ -46,6 +45,7 @@ async function createSession(userId) {
         sock: null,
         qr: null,
         isConnected: false,
+        timeout: null, // Store timeout reference
     };
 
     const sock = makeWASocket({
@@ -62,24 +62,53 @@ async function createSession(userId) {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            // Generate QR code as base64 image
             client.qr = await qrcode.toDataURL(qr);
             console.log(`QR Code generated for ${userId}`);
+
+            // Start a 30-second timeout
+            client.timeout = setTimeout(() => {
+                if (!client.isConnected) {
+                    console.log(`❌ QR not scanned within 30s. Closing session for ${userId}`);
+                    sock.end();
+                    clients.delete(userId);
+
+                    // Remove session files
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                    }
+                }
+            }, 30000);
         }
 
         if (connection === "open") {
             client.isConnected = true;
             client.qr = null;
             console.log(`✅ ${userId} connected to WhatsApp!`);
+
+            // Clear the timeout since the user is now connected
+            if (client.timeout) {
+                clearTimeout(client.timeout);
+                client.timeout = null;
+            }
         }
 
         if (connection === "close") {
             const shouldReconnect =
                 lastDisconnect?.error?.output?.statusCode !==
                 DisconnectReason.loggedOut;
-            console.log(
-                `❌ Connection closed for ${userId}. Reconnect: ${shouldReconnect}`,
-            );
+            console.log(`❌ Connection closed for ${userId}. Reconnect: ${shouldReconnect}`);
+
+            if (shouldReconnect) {
+                createSession(userId);
+            } else {
+                clients.delete(userId);
+                console.log(`Session for ${userId} removed due to logout`);
+            }
+        }
+    });
+
+    return client;
+}
 
             if (shouldReconnect) {
                 createSession(userId);
