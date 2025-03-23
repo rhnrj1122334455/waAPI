@@ -31,7 +31,7 @@ async function startBot() {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
             console.log("❌ Disconnected. Reconnecting...");
             if (shouldReconnect) {
-                setTimeout(startBot, 5000);
+                setTimeout(startBot, 15000);
             } else {
                 console.log("🚨 Session expired. Scan QR code again.");
             }
