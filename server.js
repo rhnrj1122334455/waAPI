@@ -12,6 +12,7 @@ const path = require("path");
 const qrcode = require("qrcode");
 const pino = require("pino");
 
+// Create Express server
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -19,21 +20,13 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// Configure logger with reduced verbosity
+// Setup minimal logger to reduce noise
 const logger = pino({ 
-    level: 'warn',
-    transport: {
-        target: 'pino-pretty'
-    }
+    level: 'error', // Only log errors
 });
 
-// Store client sessions
-const clients = new Map();
-
-// Connection retry settings
-const RECONNECT_DELAY = 5000; // 5 seconds
-const MAX_RETRIES = 5;
-const retryCounters = new Map();
+// Store active client sessions
+const clients = {};
 
 // Create sessions directory if it doesn't exist
 const SESSIONS_DIR = path.join(__dirname, "sessions");
@@ -41,179 +34,137 @@ if (!fs.existsSync(SESSIONS_DIR)) {
     fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Function to clear existing session
+// Clear session directory for a user
 function clearSession(userId) {
-    const sessionDir = path.join(SESSIONS_DIR, userId);
-    if (fs.existsSync(sessionDir)) {
-        try {
+    try {
+        const sessionDir = path.join(SESSIONS_DIR, userId);
+        if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
-            console.log(`Session directory for ${userId} cleared`);
-            return true;
-        } catch (error) {
-            console.error(`Failed to clear session for ${userId}:`, error);
-            return false;
+            console.log(`Session for ${userId} cleared`);
         }
+        return true;
+    } catch (error) {
+        console.error(`Failed to clear session for ${userId}:`, error);
+        return false;
     }
-    return true; // No session to clear
 }
 
-// Create a new WhatsApp session for a user
-async function createSession(userId, clearExistingSession = false) {
+// Create or get existing WhatsApp session
+async function getSession(userId, reset = false) {
+    // Close existing session if any
+    if (clients[userId] && clients[userId].sock) {
+        try {
+            clients[userId].sock.end();
+            console.log(`Closed existing session for ${userId}`);
+        } catch (err) {
+            console.error(`Error closing session for ${userId}:`, err);
+        }
+        delete clients[userId];
+    }
+
+    // Clear session files if reset requested
+    if (reset) {
+        clearSession(userId);
+    }
+
     try {
-        // Initialize retry counter if needed
-        if (!retryCounters.has(userId)) {
-            retryCounters.set(userId, 0);
-        }
-
-        // If session exists, delete it
-        if (clients.has(userId)) {
-            const existingClient = clients.get(userId);
-            if (existingClient.sock) {
-                try {
-                    existingClient.sock.end();
-                } catch (error) {
-                    console.log(`Error ending previous socket: ${error.message}`);
-                }
-            }
-            clients.delete(userId);
-            console.log(`Previous session for ${userId} closed`);
-        }
-
-        // Clear existing session files if requested
-        if (clearExistingSession) {
-            clearSession(userId);
-        }
-
+        // Ensure session directory exists
         const sessionDir = path.join(SESSIONS_DIR, userId);
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
 
-        // Fetch latest version
-        const { version } = await fetchLatestBaileysVersion();
-        console.log(`Using WA v${version.join('.')}`);
-
+        // Get auth state
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-
-        const client = {
+        
+        // Get baileys version
+        const { version } = await fetchLatestBaileysVersion();
+        
+        // Create new client record
+        clients[userId] = {
             sock: null,
             qr: null,
             isConnected: false,
-            lastError: null,
+            error: null
         };
 
-        // Create socket with more explicit options
+        // Create WhatsApp connection
         const sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: true,
             logger: logger,
-            connectTimeoutMs: 60000,
-            qrTimeout: 60000,
-            retryRequestDelayMs: 2000,
             browser: ["WhatsApp API", "Chrome", "1.0.0"],
-            // Simplified getMessage implementation
-            getMessage: async () => {
-                return { conversation: 'hello' };
-            }
+            connectTimeoutMs: 60000,
         });
 
-        client.sock = sock;
-        clients.set(userId, client);
+        // Save socket reference
+        clients[userId].sock = sock;
 
         // Handle credential updates
         sock.ev.on("creds.update", saveCreds);
 
-        // Handle connection updates
+        // Handle connection state changes
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
+            // Generate QR code if needed
             if (qr) {
-                // Reset retry counter on new QR code
-                retryCounters.set(userId, 0);
-                
-                // Generate QR code as base64 image
                 try {
-                    client.qr = await qrcode.toDataURL(qr);
-                    console.log(`QR Code generated for ${userId}`);
-                } catch (error) {
-                    console.error(`Failed to generate QR code: ${error.message}`);
-                    client.lastError = {
-                        reason: `QR generation failed: ${error.message}`,
-                        timestamp: new Date().toISOString()
-                    };
+                    clients[userId].qr = await qrcode.toDataURL(qr);
+                    console.log(`QR code generated for ${userId}`);
+                } catch (err) {
+                    console.error(`QR generation error:`, err);
                 }
             }
 
+            // Handle successful connection
             if (connection === "open") {
-                client.isConnected = true;
-                client.qr = null;
-                client.lastError = null;
-                retryCounters.set(userId, 0); // Reset retry counter on successful connection
-                console.log(`✅ ${userId} connected to WhatsApp!`);
+                clients[userId].isConnected = true;
+                clients[userId].qr = null;
+                clients[userId].error = null;
+                console.log(`✅ ${userId} connected!`);
             }
 
+            // Handle disconnection
             if (connection === "close") {
-                client.isConnected = false;
+                clients[userId].isConnected = false;
                 
-                const statusCode = lastDisconnect?.error?.output?.statusCode || 0;
-                const reason = lastDisconnect?.error?.message || "Unknown error";
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const logoutCode = DisconnectReason.loggedOut;
                 
-                console.log(`❌ Connection closed for ${userId}. Status: ${statusCode}, Reason: ${reason}`);
-                
-                client.lastError = {
-                    statusCode,
-                    reason,
-                    timestamp: new Date().toISOString()
-                };
-
-                const shouldReconnect = statusCode !== logoutCode;
-                const currentRetries = retryCounters.get(userId);
-                
-                if (shouldReconnect && currentRetries < MAX_RETRIES) {
-                    console.log(`Reconnecting ${userId} in ${RECONNECT_DELAY}ms (attempt ${currentRetries + 1}/${MAX_RETRIES})`);
-                    retryCounters.set(userId, currentRetries + 1);
-                    
-                    setTimeout(() => {
-                        // If we've had multiple failures, try clearing the session
-                        const shouldClearSession = currentRetries >= 3;
-                        createSession(userId, shouldClearSession).catch(err => {
-                            console.error(`Failed to reconnect ${userId}:`, err);
-                        });
-                    }, RECONNECT_DELAY);
+                // Check if user logged out or connection failed
+                if (statusCode === logoutCode) {
+                    console.log(`User ${userId} logged out`);
+                    delete clients[userId];
+                    clearSession(userId);
                 } else {
-                    if (currentRetries >= MAX_RETRIES) {
-                        console.log(`Max retries (${MAX_RETRIES}) reached for ${userId}. Giving up.`);
-                    } else {
-                        console.log(`User ${userId} logged out`);
-                    }
-                    
-                    clients.delete(userId);
+                    clients[userId].error = {
+                        message: lastDisconnect?.error?.message || "Unknown error",
+                        time: new Date().toISOString()
+                    };
                 }
             }
         });
 
-        return client;
+        return clients[userId];
     } catch (error) {
-        console.error(`Error creating session for ${userId}:`, error);
+        console.error(`Session creation error for ${userId}:`, error);
         throw error;
     }
 }
 
 // API Endpoints
+
+// Login/initialize session
 app.get("/login/:userId", async (req, res) => {
-    const { userId } = req.params;
-    const { reset } = req.query;
-
     try {
-        let client;
-        if (reset === "true" || !clients.has(userId)) {
-            client = await createSession(userId, reset === "true");
-        } else {
-            client = clients.get(userId);
-        }
-
+        const { userId } = req.params;
+        const { reset } = req.query;
+        const shouldReset = reset === "true";
+        
+        const client = await getSession(userId, shouldReset);
+        
         if (client.isConnected) {
             res.json({ success: true, status: "connected" });
         } else {
@@ -221,58 +172,77 @@ app.get("/login/:userId", async (req, res) => {
                 success: true, 
                 status: "pending", 
                 qr: client.qr,
-                lastError: client.lastError
+                error: client.error
             });
         }
     } catch (error) {
-        console.error(`Error in login for ${userId}:`, error);
+        console.error("Login error:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to create session",
+            error: "Login failed",
             details: error.message
         });
     }
 });
 
+// Check session status
+app.get("/status/:userId", (req, res) => {
+    const { userId } = req.params;
+    const client = clients[userId];
+    
+    if (!client) {
+        return res.json({ 
+            success: true, 
+            status: "disconnected" 
+        });
+    }
+    
+    res.json({
+        success: true,
+        status: client.isConnected ? "connected" : "pending",
+        qr: client.qr,
+        error: client.error
+    });
+});
+
+// Send message
 app.post("/send-message", async (req, res) => {
-    const { userId, number, message } = req.body;
-
-    if (!userId || !number || !message) {
-        return res.status(400).json({
-            success: false,
-            error: "Missing userId, number or message",
-        });
-    }
-
-    const client = clients.get(userId);
-    if (!client || !client.isConnected) {
-        return res.status(401).json({
-            success: false,
-            error: "WhatsApp not connected for this user",
-        });
-    }
-
-    // Format number properly
-    let formattedNumber;
     try {
-        formattedNumber = number.includes("@s.whatsapp.net")
+        const { userId, number, message } = req.body;
+        
+        // Validate input
+        if (!userId || !number || !message) {
+            return res.status(400).json({
+                success: false,
+                error: "Missing userId, number or message",
+            });
+        }
+        
+        // Check client connection
+        const client = clients[userId];
+        if (!client || !client.isConnected) {
+            return res.status(401).json({
+                success: false,
+                error: "WhatsApp not connected",
+            });
+        }
+        
+        // Format phone number
+        const cleanNumber = number.replace(/\D/g, "");
+        const formattedNumber = number.includes("@s.whatsapp.net")
             ? number
-            : `${number.replace(/[^\d]/g, '')}@s.whatsapp.net`;
-    } catch (error) {
-        return res.status(400).json({
-            success: false,
-            error: "Invalid phone number format",
-        });
-    }
-
-    try {
+            : `${cleanNumber}@s.whatsapp.net`;
+        
+        // Send message
         await client.sock.sendMessage(formattedNumber, { text: message });
-        console.log(
-            `✅ Message sent to ${formattedNumber} by ${userId}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`,
-        );
-        res.json({ success: true, message: "Message sent successfully" });
+        console.log(`✅ Message sent to ${cleanNumber} by ${userId}`);
+        
+        res.json({ 
+            success: true, 
+            message: "Message sent successfully" 
+        });
     } catch (error) {
-        console.error(`❌ Failed to send message:`, error);
+        console.error("Send message error:", error);
         res.status(500).json({
             success: false,
             error: "Failed to send message",
@@ -281,77 +251,55 @@ app.post("/send-message", async (req, res) => {
     }
 });
 
-// Check connection status
-app.get("/status/:userId", (req, res) => {
+// Logout
+app.post("/logout/:userId", (req, res) => {
     const { userId } = req.params;
-    const client = clients.get(userId);
-
-    if (!client) {
-        return res.json({ success: true, status: "disconnected" });
+    
+    if (clients[userId]) {
+        if (clients[userId].sock) {
+            try {
+                clients[userId].sock.end();
+            } catch (error) {
+                console.error(`Logout error:`, error);
+            }
+        }
+        
+        delete clients[userId];
+        clearSession(userId);
+        
+        console.log(`User ${userId} logged out`);
     }
-
-    res.json({
-        success: true,
-        status: client.isConnected ? "connected" : "pending",
-        qr: client.qr,
-        lastError: client.lastError,
-        retryCount: retryCounters.get(userId) || 0
+    
+    res.json({ 
+        success: true, 
+        message: "Logged out successfully" 
     });
 });
 
-// Logout endpoint
-app.post("/logout/:userId", (req, res) => {
-    const { userId } = req.params;
-
-    if (clients.has(userId)) {
-        const client = clients.get(userId);
-        if (client.sock) {
-            try {
-                client.sock.end();
-            } catch (error) {
-                console.log(`Error ending socket: ${error.message}`);
-            }
-        }
-        clients.delete(userId);
-        retryCounters.delete(userId);
-
-        // Remove session files
-        clearSession(userId);
-
-        console.log(`User ${userId} logged out`);
-        res.json({ success: true, message: "Logged out successfully" });
-    } else {
-        res.json({ success: true, message: "No active session" });
-    }
-});
-
-// Force reset endpoint
+// Reset session
 app.post("/reset/:userId", (req, res) => {
     const { userId } = req.params;
     
     try {
-        // Clear session data
-        clearSession(userId);
-        
-        // Close existing connection if any
-        if (clients.has(userId)) {
-            const client = clients.get(userId);
-            if (client.sock) {
-                try {
-                    client.sock.end();
-                } catch (error) {
-                    console.log(`Error ending socket: ${error.message}`);
-                }
+        // Close existing session if any
+        if (clients[userId] && clients[userId].sock) {
+            try {
+                clients[userId].sock.end();
+            } catch (error) {
+                console.error(`Error closing session:`, error);
             }
-            clients.delete(userId);
+            delete clients[userId];
         }
         
-        // Reset retry counter
-        retryCounters.delete(userId);
+        // Clear session files
+        clearSession(userId);
         
-        res.json({ success: true, message: "Session reset successfully" });
+        res.json({ 
+            success: true, 
+            message: "Session reset successfully" 
+        });
     } catch (error) {
-        console.error(`Error resetting session for ${userId}:`, error);
+        console.error(`Reset error:`, error);
         res.status(500).json({
             success: false,
             error: "Failed to reset session",
@@ -360,47 +308,28 @@ app.post("/reset/:userId", (req, res) => {
     }
 });
 
-// Health check endpoint
+// Health check
 app.get("/health", (req, res) => {
     res.json({
         success: true,
         status: "running",
-        activeSessions: clients.size,
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString()
+        activeSessions: Object.keys(clients).length,
+        uptime: process.uptime()
     });
 });
 
-// Handle process termination gracefully
-process.on("SIGTERM", () => {
-    console.log("Received SIGTERM. Cleaning up...");
-    // Close all connections
-    for (const [userId, client] of clients.entries()) {
-        if (client.sock) {
-            try {
-                client.sock.end();
-                console.log(`Closed connection for ${userId}`);
-            } catch (error) {
-                console.log(`Error closing connection for ${userId}: ${error.message}`);
-            }
-        }
-    }
-    process.exit(0);
-});
-
-// Handle uncaught exceptions to prevent crashing
+// Error handlers
 process.on("uncaughtException", (err) => {
     console.error("Uncaught Exception:", err);
-    // Keep process alive but log the error
+    // Keep process alive
 });
 
-// Handle unhandled promise rejections to prevent crashing
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled Rejection:", err);
-    // Keep process alive but log the error
+    // Keep process alive
 });
 
-// Start Express server
+// Start server
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 API Server running on port ${PORT}`);
+    console.log(`🚀 WhatsApp API Server running on port ${PORT}`);
 });
