@@ -2,18 +2,26 @@ const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const makeWASocket = require("@whiskeysockets/baileys").default;
-const { useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const { useMongoDBAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const mongoose = require("mongoose");
 
 const app = express();
-const PORT = 3000; // Change if needed
+const PORT = process.env.PORT || 3000;
+const MONGO_URI = process.env.MONGO_URI || "your_mongodb_connection_string"; // Add this in Railway environment variables
 
 app.use(cors());
 app.use(bodyParser.json());
 
+// Connect to MongoDB
+mongoose
+    .connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log("✅ Connected to MongoDB"))
+    .catch((err) => console.error("❌ MongoDB Connection Error:", err));
+
 let sock;
 
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
+    const { state, saveCreds } = await useMongoDBAuthState(MONGO_URI);
 
     sock = makeWASocket({
         auth: state,
@@ -31,7 +39,7 @@ async function startBot() {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
             console.log("❌ Disconnected. Reconnecting...");
             if (shouldReconnect) {
-                setTimeout(startBot, 15000);
+                setTimeout(startBot, 5000);
             } else {
                 console.log("🚨 Session expired. Scan QR code again.");
             }
