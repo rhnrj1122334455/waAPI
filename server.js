@@ -1,46 +1,48 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    delay
-} = require("@whiskeysockets/baileys");
+const makeWASocket = require("@whiskeysockets/baileys").default;
+const { useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
 
 const app = express();
-const PORT = 3000;
+const PORT = 3000; // Change if needed
 
 app.use(cors());
 app.use(bodyParser.json());
 
-let sock; // Global socket variable
+let sock;
 
 async function startBot() {
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
 
-        sock = makeWASocket({
-            auth: state,
-            printQRInTerminal: true,
-        });
+    sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+    });
 
-        sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", saveCreds);
 
-        sock.ev.on("connection.update", async ({ connection }) => {
-            if (connection === "open") {
-                console.log("✅ Connected to WhatsApp!");
-            } else if (connection === "close") {
-                console.log("❌ Disconnected. Reconnecting...");
-                await delay(5000);
-                startBot();
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect } = update;
+
+        if (connection === "open") {
+            console.log("✅ Connected to WhatsApp!");
+        } else if (connection === "close") {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+            console.log("❌ Disconnected. Reconnecting...");
+            if (shouldReconnect) {
+                setTimeout(startBot, 5000);
             } else {
-                console.log(`⚠️ Connection status: ${connection}`);
+                console.log("🚨 Session expired. Scan QR code again.");
             }
-        });
+        } else {
+            console.log(`⚠️ Connection status: ${connection}`);
+        }
+    });
 
-    } catch (error) {
-        console.error("❌ Failed to start bot:", error);
-    }
+    sock.ev.on("messages.upsert", async (message) => {
+        console.log("📩 New message received:", JSON.stringify(message, null, 2));
+    });
 }
 
 // API Endpoint to send messages
@@ -48,17 +50,7 @@ app.post("/send-message", async (req, res) => {
     const { number, message } = req.body;
 
     if (!number || !message) {
-        return res.status(400).json({
-            success: false,
-            error: "Missing number or message",
-        });
-    }
-
-    if (!sock) {
-        return res.status(500).json({
-            success: false,
-            error: "WhatsApp bot is not connected yet. Try again later.",
-        });
+        return res.status(400).json({ success: false, error: "Missing number or message" });
     }
 
     const formattedNumber = number.includes("@s.whatsapp.net")
@@ -66,25 +58,18 @@ app.post("/send-message", async (req, res) => {
         : number + "@s.whatsapp.net";
 
     try {
-        console.log(`📩 Sending message to: ${formattedNumber}`);
-
-        const sentMsg = await sock.sendMessage(formattedNumber, { text: message });
-
-        console.log(`✅ Message successfully sent to ${formattedNumber}`);
-        res.json({ success: true, message: "Message sent successfully", id: sentMsg.key.id });
-
+        const result = await sock.sendMessage(formattedNumber, { text: message });
+        console.log(`✅ Message sent to ${formattedNumber}: ${message}`);
+        res.json({ success: true, message: "Message sent successfully", result });
     } catch (error) {
-        console.error(`❌ Failed to send message: ${error.message}`);
-        res.status(500).json({
-            success: false,
-            error: error.message || "Failed to send message",
-        });
+        console.error("❌ Failed to send message:", error);
+        res.status(500).json({ success: false, error: error.toString() });
     }
 });
 
-// Start the bot and the API server
-startBot();
-
+// Start Express server
 app.listen(PORT, () => {
     console.log(`🚀 API Server running on http://localhost:${PORT}`);
 });
+
+startBot();
