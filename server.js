@@ -20,9 +20,9 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// Setup minimal logger to reduce noise
+// Setup minimal logger without transport (fixes the error)
 const logger = pino({ 
-    level: 'error', // Only log errors
+    level: 'error' // Only log errors
 });
 
 // Store active client sessions
