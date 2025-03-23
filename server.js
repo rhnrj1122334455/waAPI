@@ -5,16 +5,28 @@ const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
+    fetchLatestBaileysVersion,
 } = require("@whiskeysockets/baileys");
 const fs = require("fs");
 const path = require("path");
 const qrcode = require("qrcode");
+// Explicitly require crypto module
+const crypto = require("crypto");
+const pino = require("pino");
 
 const app = express();
 const PORT = 3000; // Change if needed
 
 app.use(cors());
 app.use(bodyParser.json());
+
+// Configure logger
+const logger = pino({ 
+    level: 'warn',
+    transport: {
+        target: 'pino-pretty'
+    }
+});
 
 // Store client sessions
 const clients = new Map();
@@ -56,7 +68,13 @@ async function createSession(userId, clearExistingSession = false) {
     // If session exists, delete it
     if (clients.has(userId)) {
         const existingClient = clients.get(userId);
-        existingClient.sock.end();
+        if (existingClient.sock) {
+            try {
+                existingClient.sock.end();
+            } catch (error) {
+                console.log(`Error ending previous socket: ${error.message}`);
+            }
+        }
         clients.delete(userId);
         console.log(`Previous session for ${userId} closed`);
     }
@@ -71,90 +89,110 @@ async function createSession(userId, clearExistingSession = false) {
         fs.mkdirSync(sessionDir, { recursive: true });
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    try {
+        // Fetch latest version
+        const { version } = await fetchLatestBaileysVersion();
+        console.log(`Using WA v${version.join('.')}`);
 
-    const client = {
-        sock: null,
-        qr: null,
-        isConnected: false,
-        lastError: null,
-    };
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true,
-        connectTimeoutMs: 60000,
-        qrTimeout: 60000,
-        retryRequestDelayMs: 2000,
-        browser: ["WhatsApp API", "Chrome", "1.0.0"],
-        version: [2, 2323, 4],
-    });
+        const client = {
+            sock: null,
+            qr: null,
+            isConnected: false,
+            lastError: null,
+        };
 
-    client.sock = sock;
-    clients.set(userId, client);
+        // Create socket with more explicit options
+        const sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: true,
+            logger: logger,
+            connectTimeoutMs: 60000,
+            qrTimeout: 60000,
+            retryRequestDelayMs: 2000,
+            browser: ["WhatsApp API", "Chrome", "1.0.0"],
+            getMessage: async () => {
+                return { conversation: 'hello' };
+            },
+            // Add this to ensure crypto is properly initialized
+            patchMessageBeforeSending: (message) => message
+        });
 
-    sock.ev.on("creds.update", saveCreds);
+        client.sock = sock;
+        clients.set(userId, client);
 
-    sock.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        sock.ev.on("creds.update", saveCreds);
 
-        if (qr) {
-            // Reset retry counter on new QR code
-            retryCounters.set(userId, 0);
-            
-            // Generate QR code as base64 image
-            client.qr = await qrcode.toDataURL(qr);
-            console.log(`QR Code generated for ${userId}`);
-        }
+        sock.ev.on("connection.update", async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-        if (connection === "open") {
-            client.isConnected = true;
-            client.qr = null;
-            client.lastError = null;
-            retryCounters.set(userId, 0); // Reset retry counter on successful connection
-            console.log(`✅ ${userId} connected to WhatsApp!`);
-        }
-
-        if (connection === "close") {
-            client.isConnected = false;
-            
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const reason = lastDisconnect?.error?.message || "Unknown error";
-            const logoutCode = DisconnectReason.loggedOut;
-            
-            console.log(`❌ Connection closed for ${userId}. Status: ${statusCode}, Reason: ${reason}`);
-            
-            client.lastError = {
-                statusCode,
-                reason,
-                timestamp: new Date().toISOString()
-            };
-
-            const shouldReconnect = statusCode !== logoutCode;
-            const currentRetries = retryCounters.get(userId);
-            
-            if (shouldReconnect && currentRetries < MAX_RETRIES) {
-                console.log(`Reconnecting ${userId} in ${RECONNECT_DELAY}ms (attempt ${currentRetries + 1}/${MAX_RETRIES})`);
-                retryCounters.set(userId, currentRetries + 1);
+            if (qr) {
+                // Reset retry counter on new QR code
+                retryCounters.set(userId, 0);
                 
-                setTimeout(() => {
-                    // If we've had multiple failures, try clearing the session
-                    const shouldClearSession = currentRetries >= 3;
-                    createSession(userId, shouldClearSession);
-                }, RECONNECT_DELAY);
-            } else {
-                if (currentRetries >= MAX_RETRIES) {
-                    console.log(`Max retries (${MAX_RETRIES}) reached for ${userId}. Giving up.`);
-                } else {
-                    console.log(`User ${userId} logged out`);
+                // Generate QR code as base64 image
+                try {
+                    client.qr = await qrcode.toDataURL(qr);
+                    console.log(`QR Code generated for ${userId}`);
+                } catch (error) {
+                    console.error(`Failed to generate QR code: ${error.message}`);
                 }
-                
-                clients.delete(userId);
             }
-        }
-    });
 
-    return client;
+            if (connection === "open") {
+                client.isConnected = true;
+                client.qr = null;
+                client.lastError = null;
+                retryCounters.set(userId, 0); // Reset retry counter on successful connection
+                console.log(`✅ ${userId} connected to WhatsApp!`);
+            }
+
+            if (connection === "close") {
+                client.isConnected = false;
+                
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const reason = lastDisconnect?.error?.message || "Unknown error";
+                const logoutCode = DisconnectReason.loggedOut;
+                
+                console.log(`❌ Connection closed for ${userId}. Status: ${statusCode}, Reason: ${reason}`);
+                
+                client.lastError = {
+                    statusCode,
+                    reason,
+                    timestamp: new Date().toISOString()
+                };
+
+                const shouldReconnect = statusCode !== logoutCode;
+                const currentRetries = retryCounters.get(userId);
+                
+                if (shouldReconnect && currentRetries < MAX_RETRIES) {
+                    console.log(`Reconnecting ${userId} in ${RECONNECT_DELAY}ms (attempt ${currentRetries + 1}/${MAX_RETRIES})`);
+                    retryCounters.set(userId, currentRetries + 1);
+                    
+                    setTimeout(() => {
+                        // If we've had multiple failures, try clearing the session
+                        const shouldClearSession = currentRetries >= 3;
+                        createSession(userId, shouldClearSession);
+                    }, RECONNECT_DELAY);
+                } else {
+                    if (currentRetries >= MAX_RETRIES) {
+                        console.log(`Max retries (${MAX_RETRIES}) reached for ${userId}. Giving up.`);
+                    } else {
+                        console.log(`User ${userId} logged out`);
+                    }
+                    
+                    clients.delete(userId);
+                }
+            }
+        });
+
+        return client;
+    } catch (error) {
+        console.error(`Error creating session for ${userId}:`, error);
+        throw error;
+    }
 }
 
 // API Endpoints
@@ -252,7 +290,13 @@ app.post("/logout/:userId", (req, res) => {
 
     if (clients.has(userId)) {
         const client = clients.get(userId);
-        client.sock.end();
+        if (client.sock) {
+            try {
+                client.sock.end();
+            } catch (error) {
+                console.log(`Error ending socket: ${error.message}`);
+            }
+        }
         clients.delete(userId);
         retryCounters.delete(userId);
 
@@ -277,7 +321,13 @@ app.post("/reset/:userId", (req, res) => {
         // Close existing connection if any
         if (clients.has(userId)) {
             const client = clients.get(userId);
-            client.sock.end();
+            if (client.sock) {
+                try {
+                    client.sock.end();
+                } catch (error) {
+                    console.log(`Error ending socket: ${error.message}`);
+                }
+            }
             clients.delete(userId);
         }
         
@@ -311,8 +361,12 @@ process.on("SIGTERM", () => {
     // Close all connections
     for (const [userId, client] of clients.entries()) {
         if (client.sock) {
-            client.sock.end();
-            console.log(`Closed connection for ${userId}`);
+            try {
+                client.sock.end();
+                console.log(`Closed connection for ${userId}`);
+            } catch (error) {
+                console.log(`Error closing connection for ${userId}: ${error.message}`);
+            }
         }
     }
     process.exit(0);
