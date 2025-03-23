@@ -10,17 +10,16 @@ const {
 const fs = require("fs");
 const path = require("path");
 const qrcode = require("qrcode");
-// Explicitly require crypto module
-const crypto = require("crypto");
 const pino = require("pino");
 
 const app = express();
-const PORT = 3000; // Change if needed
+const PORT = process.env.PORT || 3000;
 
+// Middleware setup
 app.use(cors());
 app.use(bodyParser.json());
 
-// Configure logger
+// Configure logger with reduced verbosity
 const logger = pino({ 
     level: 'warn',
     transport: {
@@ -42,7 +41,7 @@ if (!fs.existsSync(SESSIONS_DIR)) {
     fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Clear existing session
+// Function to clear existing session
 function clearSession(userId) {
     const sessionDir = path.join(SESSIONS_DIR, userId);
     if (fs.existsSync(sessionDir)) {
@@ -60,36 +59,36 @@ function clearSession(userId) {
 
 // Create a new WhatsApp session for a user
 async function createSession(userId, clearExistingSession = false) {
-    // Initialize retry counter if needed
-    if (!retryCounters.has(userId)) {
-        retryCounters.set(userId, 0);
-    }
-
-    // If session exists, delete it
-    if (clients.has(userId)) {
-        const existingClient = clients.get(userId);
-        if (existingClient.sock) {
-            try {
-                existingClient.sock.end();
-            } catch (error) {
-                console.log(`Error ending previous socket: ${error.message}`);
-            }
-        }
-        clients.delete(userId);
-        console.log(`Previous session for ${userId} closed`);
-    }
-
-    // Clear existing session files if requested
-    if (clearExistingSession) {
-        clearSession(userId);
-    }
-
-    const sessionDir = path.join(SESSIONS_DIR, userId);
-    if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir, { recursive: true });
-    }
-
     try {
+        // Initialize retry counter if needed
+        if (!retryCounters.has(userId)) {
+            retryCounters.set(userId, 0);
+        }
+
+        // If session exists, delete it
+        if (clients.has(userId)) {
+            const existingClient = clients.get(userId);
+            if (existingClient.sock) {
+                try {
+                    existingClient.sock.end();
+                } catch (error) {
+                    console.log(`Error ending previous socket: ${error.message}`);
+                }
+            }
+            clients.delete(userId);
+            console.log(`Previous session for ${userId} closed`);
+        }
+
+        // Clear existing session files if requested
+        if (clearExistingSession) {
+            clearSession(userId);
+        }
+
+        const sessionDir = path.join(SESSIONS_DIR, userId);
+        if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
+        }
+
         // Fetch latest version
         const { version } = await fetchLatestBaileysVersion();
         console.log(`Using WA v${version.join('.')}`);
@@ -113,18 +112,19 @@ async function createSession(userId, clearExistingSession = false) {
             qrTimeout: 60000,
             retryRequestDelayMs: 2000,
             browser: ["WhatsApp API", "Chrome", "1.0.0"],
+            // Simplified getMessage implementation
             getMessage: async () => {
                 return { conversation: 'hello' };
-            },
-            // Add this to ensure crypto is properly initialized
-            patchMessageBeforeSending: (message) => message
+            }
         });
 
         client.sock = sock;
         clients.set(userId, client);
 
+        // Handle credential updates
         sock.ev.on("creds.update", saveCreds);
 
+        // Handle connection updates
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
@@ -138,6 +138,10 @@ async function createSession(userId, clearExistingSession = false) {
                     console.log(`QR Code generated for ${userId}`);
                 } catch (error) {
                     console.error(`Failed to generate QR code: ${error.message}`);
+                    client.lastError = {
+                        reason: `QR generation failed: ${error.message}`,
+                        timestamp: new Date().toISOString()
+                    };
                 }
             }
 
@@ -152,7 +156,7 @@ async function createSession(userId, clearExistingSession = false) {
             if (connection === "close") {
                 client.isConnected = false;
                 
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const statusCode = lastDisconnect?.error?.output?.statusCode || 0;
                 const reason = lastDisconnect?.error?.message || "Unknown error";
                 const logoutCode = DisconnectReason.loggedOut;
                 
@@ -174,7 +178,9 @@ async function createSession(userId, clearExistingSession = false) {
                     setTimeout(() => {
                         // If we've had multiple failures, try clearing the session
                         const shouldClearSession = currentRetries >= 3;
-                        createSession(userId, shouldClearSession);
+                        createSession(userId, shouldClearSession).catch(err => {
+                            console.error(`Failed to reconnect ${userId}:`, err);
+                        });
                     }, RECONNECT_DELAY);
                 } else {
                     if (currentRetries >= MAX_RETRIES) {
@@ -219,7 +225,7 @@ app.get("/login/:userId", async (req, res) => {
             });
         }
     } catch (error) {
-        console.error(`Error creating session for ${userId}:`, error);
+        console.error(`Error in login for ${userId}:`, error);
         res.status(500).json({
             success: false,
             error: "Failed to create session",
@@ -246,14 +252,23 @@ app.post("/send-message", async (req, res) => {
         });
     }
 
-    const formattedNumber = number.includes("@s.whatsapp.net")
-        ? number
-        : number + "@s.whatsapp.net";
+    // Format number properly
+    let formattedNumber;
+    try {
+        formattedNumber = number.includes("@s.whatsapp.net")
+            ? number
+            : `${number.replace(/[^\d]/g, '')}@s.whatsapp.net`;
+    } catch (error) {
+        return res.status(400).json({
+            success: false,
+            error: "Invalid phone number format",
+        });
+    }
 
     try {
         await client.sock.sendMessage(formattedNumber, { text: message });
         console.log(
-            `✅ Message sent to ${formattedNumber} by ${userId}: ${message}`,
+            `✅ Message sent to ${formattedNumber} by ${userId}: ${message.substring(0, 30)}${message.length > 30 ? '...' : ''}`,
         );
         res.json({ success: true, message: "Message sent successfully" });
     } catch (error) {
@@ -351,7 +366,8 @@ app.get("/health", (req, res) => {
         success: true,
         status: "running",
         activeSessions: clients.size,
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -372,11 +388,13 @@ process.on("SIGTERM", () => {
     process.exit(0);
 });
 
+// Handle uncaught exceptions to prevent crashing
 process.on("uncaughtException", (err) => {
     console.error("Uncaught Exception:", err);
     // Keep process alive but log the error
 });
 
+// Handle unhandled promise rejections to prevent crashing
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled Rejection:", err);
     // Keep process alive but log the error
