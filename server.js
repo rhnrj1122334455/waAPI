@@ -110,26 +110,14 @@ async function createSession(userId) {
     return client;
 }
 
-            if (shouldReconnect) {
-                createSession(userId);
-            } else {
-                clients.delete(userId);
-                console.log(`Session for ${userId} removed due to logout`);
-            }
-        }
-    });
-
-    return client;
-}
-
 // API Endpoints
 app.get("/login/:userId", async (req, res) => {
     const { userId } = req.params;
+    const forceNew = req.query.force === 'true';
 
     try {
-        const client = clients.has(userId)
-            ? clients.get(userId)
-            : await createSession(userId);
+        // Always create a new session to clear any potentially stuck sessions
+        const client = await createSession(userId);
 
         if (client.isConnected) {
             res.json({ success: true, status: "connected" });
